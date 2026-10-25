@@ -20,9 +20,9 @@ type raftNode struct {
 	electionTimeout  int // randomized
 	heartbeatElapsed int
 
-	// TODO(M2): votes map[NodeID]bool, preVotes map[NodeID]bool
-	// TODO(M3): leader-only nextIndex / matchIndex per peer
-
+	votes      map[NodeID]bool
+	matchIndex map[NodeID]Index // Highest log entry known to be replicated on peer
+	nextIndex  map[NodeID]Index // Next log entry to send to peer
 	// Ready bookkeeping.
 	hsDirty   bool
 	dirtyFrom Index // lowest log index modified since the last Advance (0 = clean)
@@ -32,7 +32,14 @@ type raftNode struct {
 
 // New restores a node from persisted state. Always starts as a Follower.
 func New(cfg Config, p Persisted) Node {
-	n := &raftNode{cfg: cfg, hs: p.HardState, log: append([]Entry(nil), p.Log...)}
+	n := &raftNode{
+		cfg:        cfg,
+		hs:         p.HardState,
+		log:        append([]Entry(nil), p.Log...),
+		votes:      make(map[NodeID]bool),
+		matchIndex: make(map[NodeID]Index),
+		nextIndex:  make(map[NodeID]Index),
+	}
 	n.becomeFollower(n.hs.Term, 0)
 	return n
 }
@@ -151,32 +158,287 @@ func (n *raftNode) Tick() {
 	case Follower, PreCandidate, Candidate:
 		n.electionElapsed++
 		if n.electionElapsed >= n.electionTimeout {
-			// TODO(M2): start an election (PreVote first if cfg.PreVote):
-			//   become (Pre)Candidate, bump term, vote for self, persist,
-			//   send MsgVote to every peer, reset the election timer.
-			n.resetElectionTimer() // placeholder so the skeleton doesn't spin
+			if n.cfg.PreVote && n.role != Leader {
+				n.preCampaign()
+			} else {
+				n.campaign()
+			}
 		}
 	case Leader:
 		n.heartbeatElapsed++
 		if n.heartbeatElapsed >= n.cfg.HeartbeatTicks {
-			// TODO(M2/M3): broadcast heartbeats / AppendEntries.
 			n.heartbeatElapsed = 0
+			n.bcastAppend()
 		}
 		// TODO(M5): if cfg.CheckQuorum, step down when no quorum was heard from.
 	}
 }
 
+func (n *raftNode) preCampaign() {
+	n.role = PreCandidate
+	n.leader = 0
+	n.votes = make(map[NodeID]bool)
+	n.votes[n.cfg.ID] = true
+	n.resetElectionTimer()
+
+	if len(n.cfg.Peers) == 1 {
+		n.campaign()
+		return
+	}
+
+	for _, peer := range n.cfg.Peers {
+		if peer == n.cfg.ID {
+			continue
+		}
+		n.send(Message{
+			Type:         MsgPreVote,
+			To:           peer,
+			Term:         n.hs.Term + 1, // Ask if they will vote for us in the NEXT term
+			LastLogIndex: n.lastIndex(),
+			LastLogTerm:  n.lastTerm(),
+		})
+	}
+}
+
+func (n *raftNode) campaign() {
+	n.role = Candidate
+	// Increment term and vote for ourselves. setHardState handles dirtying the struct for disk write.
+	n.setHardState(n.hs.Term+1, n.cfg.ID)
+	n.leader = 0
+
+	n.votes = make(map[NodeID]bool)
+	n.votes[n.cfg.ID] = true // Vote for self
+
+	n.resetElectionTimer() // Reroll the random timeout
+
+	// If we are a 1-node cluster, we win instantly
+	if len(n.cfg.Peers) == 1 {
+		n.becomeLeader()
+		return
+	}
+
+	// Request votes from all peers
+	for _, peer := range n.cfg.Peers {
+		if peer == n.cfg.ID {
+			continue
+		}
+
+		lastIndex := n.lastIndex()
+		lastTerm := n.lastTerm()
+
+		n.send(Message{
+			Type:         MsgVote,
+			To:           peer,
+			Term:         n.hs.Term,
+			LastLogIndex: lastIndex,
+			LastLogTerm:  lastTerm,
+		})
+	}
+}
+
+func (n *raftNode) becomeLeader() {
+	n.role = Leader
+	n.leader = n.cfg.ID
+	n.heartbeatElapsed = 0
+
+	n.matchIndex = make(map[NodeID]Index)
+	n.nextIndex = make(map[NodeID]Index)
+	lastIdx := n.lastIndex()
+	for _, peer := range n.cfg.Peers {
+		n.matchIndex[peer] = 0
+		n.nextIndex[peer] = lastIdx + 1
+	}
+
+	// M3: Append a no-op entry in our own term to safely commit older entries
+	n.appendLocal(Entry{
+		Term:  n.hs.Term,
+		Index: n.lastIndex() + 1,
+		Data:  nil,
+	})
+	n.matchIndex[n.cfg.ID] = n.lastIndex()
+
+	if len(n.cfg.Peers) == 1 {
+		n.advanceCommit()
+	}
+	n.bcastAppend()
+}
+
 // Step processes one incoming message.
 func (n *raftNode) Step(m Message) {
-	// TODO(M2): term handling first, for EVERY message type:
-	//   m.Term > ours  => becomeFollower(m.Term, ...)
-	//   m.Term < ours  => reply with our term (or ignore) and return
-	// then dispatch on m.Type:
-	//   MsgVote/MsgVoteResp           (M2, incl. "candidate's log at least as up-to-date")
-	//   MsgApp/MsgAppResp/Heartbeat   (M3, incl. prevLogIndex/prevLogTerm check,
-	//                                  conflict truncation, commit advance)
-	//   MsgPreVote/MsgPreVoteResp     (M5)
-	_ = m
+	// Rule 1: Always check terms before anything else.
+	if m.Term > n.hs.Term {
+		// PreVote messages evaluate a future term. Do not step down!
+		if m.Type != MsgPreVote && m.Type != MsgPreVoteResp {
+			n.becomeFollower(m.Term, 0)
+		}
+	} else if m.Term < n.hs.Term {
+		// Ignore messages from older terms
+		if m.Type == MsgVote {
+			n.send(Message{To: m.From, Type: MsgVoteResp, Term: n.hs.Term, Reject: true})
+		}
+		if m.Type == MsgApp {
+			n.send(Message{To: m.From, Type: MsgAppResp, Term: n.hs.Term, Reject: true})
+		}
+		if m.Type == MsgPreVote {
+			n.send(Message{To: m.From, Type: MsgPreVoteResp, Term: n.hs.Term, Reject: true})
+		}
+		return
+	}
+
+	switch m.Type {
+	case MsgPreVote:
+		lastIndex := n.lastIndex()
+		lastTerm := n.lastTerm()
+		isUpToDate := m.LastLogTerm > lastTerm || (m.LastLogTerm == lastTerm && m.LastLogIndex >= lastIndex)
+
+		if isUpToDate {
+			n.send(Message{To: m.From, Type: MsgPreVoteResp, Term: n.hs.Term, Reject: false})
+		} else {
+			n.send(Message{To: m.From, Type: MsgPreVoteResp, Term: n.hs.Term, Reject: true})
+		}
+
+	case MsgPreVoteResp:
+		if n.role != PreCandidate {
+			return
+		}
+		if !m.Reject {
+			n.votes[m.From] = true
+			quorum := (len(n.cfg.Peers) / 2) + 1
+			if len(n.votes) >= quorum {
+				n.campaign() // We got a PreVote majority! Start the REAL election.
+			}
+		}
+
+	case MsgVote:
+		// We can vote if we haven't voted yet, or if we already voted for this specific candidate in this term.
+		canVote := n.hs.VotedFor == 0 || n.hs.VotedFor == m.From
+
+		// Candidate's log must be at least as up-to-date as ours
+		lastIndex := n.lastIndex()
+		lastTerm := n.lastTerm()
+		isUpToDate := m.LastLogTerm > lastTerm || (m.LastLogTerm == lastTerm && m.LastLogIndex >= lastIndex)
+
+		if canVote && isUpToDate {
+			n.setHardState(n.hs.Term, m.From)
+			n.resetElectionTimer() // Don't start an election while a valid candidate is campaigning
+			n.send(Message{To: m.From, Type: MsgVoteResp, Term: n.hs.Term, Reject: false})
+		} else {
+			n.send(Message{To: m.From, Type: MsgVoteResp, Term: n.hs.Term, Reject: true})
+		}
+
+	case MsgVoteResp:
+		if n.role != Candidate {
+			return
+		}
+
+		if !m.Reject {
+			n.votes[m.From] = true
+			// Check for quorum
+			quorum := (len(n.cfg.Peers) / 2) + 1
+			if len(n.votes) >= quorum {
+				n.becomeLeader()
+			}
+		}
+
+	case MsgApp:
+		n.role = Follower
+		n.leader = m.From
+		n.resetElectionTimer()
+
+		// Verify PrevLogTerm at PrevLogIndex.
+		term, ok := n.termAt(m.PrevLogIndex)
+		if !ok || term != m.PrevLogTerm {
+			n.send(Message{
+				To:         m.From,
+				Type:       MsgAppResp,
+				Term:       n.hs.Term,
+				Reject:     true,
+				RejectHint: n.lastIndex(),
+			})
+			return
+		}
+
+		// If it matches, truncate any conflicting log entries, append new ones.
+		for i, entry := range m.Entries {
+			if entry.Index <= n.lastIndex() {
+				if n.log[entry.Index-1].Term != entry.Term {
+					n.appendLocal(m.Entries[i:]...)
+					break
+				}
+			} else {
+				n.appendLocal(m.Entries[i:]...)
+				break
+			}
+		}
+
+		// Update n.commit to min(LeaderCommit, index of last new entry).
+		lastNewIndex := m.PrevLogIndex + Index(len(m.Entries))
+		if m.LeaderCommit > n.commit {
+			newCommit := m.LeaderCommit
+			if lastNewIndex < newCommit {
+				newCommit = lastNewIndex
+			}
+			if newCommit > n.commit {
+				n.commit = newCommit
+			}
+		}
+
+		// Reply Reject: false with the MatchIndex.
+		n.send(Message{
+			To:         m.From,
+			Type:       MsgAppResp,
+			Term:       n.hs.Term,
+			Reject:     false,
+			MatchIndex: lastNewIndex,
+		})
+
+	case MsgAppResp:
+		if n.role != Leader {
+			return
+		}
+		if m.Reject {
+			if n.nextIndex[m.From] > 1 {
+				n.nextIndex[m.From]--
+				if m.RejectHint+1 < n.nextIndex[m.From] {
+					n.nextIndex[m.From] = m.RejectHint + 1
+				}
+			}
+			if n.nextIndex[m.From] < 1 {
+				n.nextIndex[m.From] = 1
+			}
+			n.sendAppend(m.From)
+		} else {
+			if m.MatchIndex > n.matchIndex[m.From] {
+				n.matchIndex[m.From] = m.MatchIndex
+			}
+			if m.MatchIndex+1 > n.nextIndex[m.From] {
+				n.nextIndex[m.From] = m.MatchIndex + 1
+			}
+			n.advanceCommit()
+		}
+
+	case MsgHeartbeat:
+		n.role = Follower
+		n.leader = m.From
+		n.resetElectionTimer()
+		if m.LeaderCommit > n.commit {
+			if m.LeaderCommit < n.lastIndex() {
+				n.commit = m.LeaderCommit
+			} else {
+				n.commit = n.lastIndex()
+			}
+		}
+		n.send(Message{
+			To:   m.From,
+			Type: MsgHeartbeatResp,
+			Term: n.hs.Term,
+		})
+
+	case MsgHeartbeatResp:
+		if n.role != Leader {
+			return
+		}
+	}
 }
 
 // Propose appends a client command if we are the leader.
@@ -184,9 +446,71 @@ func (n *raftNode) Propose(data []byte) bool {
 	if n.role != Leader {
 		return false
 	}
-	// TODO(M3): n.appendLocal(Entry{Term: n.hs.Term, Index: n.lastIndex()+1, Data: data});
-	//           then replicate. Remember: a leader may only advance commit by
-	//           counting replicas for entries of ITS OWN term (paper Figure 8).
-	_ = data
-	return false
+	n.appendLocal(Entry{
+		Term:  n.hs.Term,
+		Index: n.lastIndex() + 1,
+		Data:  data,
+	})
+	n.matchIndex[n.cfg.ID] = n.lastIndex()
+	if len(n.cfg.Peers) == 1 {
+		n.advanceCommit()
+	}
+	n.bcastAppend()
+	return true
+}
+
+func (n *raftNode) sendAppend(to NodeID) {
+	ni := n.nextIndex[to]
+	if ni == 0 {
+		ni = 1
+	}
+	prevLogIndex := ni - 1
+	prevLogTerm, _ := n.termAt(prevLogIndex)
+
+	var ents []Entry
+	if ni <= n.lastIndex() {
+		ents = append([]Entry(nil), n.log[ni-1:]...)
+	}
+
+	n.send(Message{
+		Type:         MsgApp,
+		To:           to,
+		Term:         n.hs.Term,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      ents,
+		LeaderCommit: n.commit,
+	})
+}
+
+func (n *raftNode) bcastAppend() {
+	for _, peer := range n.cfg.Peers {
+		if peer == n.cfg.ID {
+			continue
+		}
+		n.sendAppend(peer)
+	}
+}
+
+func (n *raftNode) advanceCommit() {
+	if n.role != Leader {
+		return
+	}
+	quorum := (len(n.cfg.Peers) / 2) + 1
+	for N := n.lastIndex(); N > n.commit; N-- {
+		if n.log[N-1].Term != n.hs.Term {
+			continue
+		}
+		matchCount := 0
+		for _, peer := range n.cfg.Peers {
+			if n.matchIndex[peer] >= N {
+				matchCount++
+			}
+		}
+		if matchCount >= quorum {
+			n.commit = N
+			n.bcastAppend()
+			break
+		}
+	}
 }
