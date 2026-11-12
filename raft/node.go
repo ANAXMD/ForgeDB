@@ -28,6 +28,14 @@ type raftNode struct {
 	dirtyFrom Index // lowest log index modified since the last Advance (0 = clean)
 	msgs      []Message
 	readyAt   Index // commit index captured by the last Ready(), applied on Advance
+
+	// Snapshot of what the last Ready() handed to the driver.
+	rdOut        bool
+	rdHSValid    bool
+	rdHS         HardState
+	rdMsgs       int
+	rdLast       Index
+	appendedFrom Index
 }
 
 // validate panics with a descriptive message if the configuration or
@@ -138,6 +146,9 @@ func (n *raftNode) appendLocal(ents ...Entry) {
 	if n.dirtyFrom == 0 || first < n.dirtyFrom {
 		n.dirtyFrom = first
 	}
+	if n.appendedFrom == 0 || first < n.appendedFrom {
+		n.appendedFrom = first
+	}
 }
 
 func (n *raftNode) setHardState(term Term, votedFor NodeID) {
@@ -177,28 +188,59 @@ func (n *raftNode) Log() []Entry { return append([]Entry(nil), n.log...) }
 
 func (n *raftNode) Ready() (Ready, bool) {
 	var rd Ready
+
+	n.rdHSValid = false
 	if n.hsDirty {
 		hs := n.hs
 		rd.HardState = &hs
+		n.rdHSValid, n.rdHS = true, hs
 	}
+
 	if n.dirtyFrom != 0 {
 		rd.Entries = append([]Entry(nil), n.log[n.dirtyFrom-1:]...)
 	}
-	rd.Messages = n.msgs
+
+	rd.Messages = append([]Message(nil), n.msgs...)
+	n.rdMsgs = len(n.msgs)
+	n.rdLast = n.lastIndex()
+	n.appendedFrom = 0
+
 	if n.commit > n.applied {
 		rd.Committed = append([]Entry(nil), n.log[n.applied:n.commit]...)
 		n.readyAt = n.commit
 	}
+
 	if rd.Empty() {
+		n.rdOut = false
 		return Ready{}, false
 	}
+
+	n.rdOut = true
 	return rd, true
 }
 
 func (n *raftNode) Advance() {
-	n.hsDirty = false
-	n.dirtyFrom = 0
-	n.msgs = nil
+	if !n.rdOut {
+		return
+	}
+	n.rdOut = false
+
+	if n.rdHSValid && n.hs == n.rdHS {
+		n.hsDirty = false
+	}
+
+	if n.appendedFrom == 0 {
+		n.dirtyFrom = 0
+	} else {
+		n.dirtyFrom = n.appendedFrom
+		if n.rdLast+1 < n.dirtyFrom {
+			n.dirtyFrom = n.rdLast + 1
+		}
+	}
+	n.appendedFrom = 0
+
+	n.msgs = append([]Message(nil), n.msgs[n.rdMsgs:]...)
+
 	if n.readyAt > n.applied {
 		n.applied = n.readyAt
 	}
