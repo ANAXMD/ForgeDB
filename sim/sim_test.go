@@ -3,8 +3,8 @@ package sim_test
 import (
 	"testing"
 
-	"github.com/ANAXMD/raft-lab/raft"
-	"github.com/ANAXMD/raft-lab/sim"
+	"github.com/ANAXMD/ForgeDB/raft"
+	"github.com/ANAXMD/ForgeDB/sim"
 )
 
 // pingNode is a fake raft.Node used ONLY to test the simulator itself: it

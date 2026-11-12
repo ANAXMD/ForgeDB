@@ -17,7 +17,7 @@ import (
 	"hash/fnv"
 	"math/rand"
 
-	"github.com/ANAXMD/raft-lab/raft"
+	"github.com/ANAXMD/ForgeDB/raft"
 )
 
 // NodeFactory builds a node; tests can swap in fakes. Default is raft.New.

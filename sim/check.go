@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/ANAXMD/raft-lab/raft"
+	"github.com/ANAXMD/ForgeDB/raft"
 )
 
 // The safety checker. It runs after EVERY simulated event and records

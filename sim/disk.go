@@ -1,6 +1,6 @@
 package sim
 
-import "github.com/ANAXMD/raft-lab/raft"
+import "github.com/ANAXMD/ForgeDB/raft"
 
 // Disk is a fake disk with the one property that matters for Raft:
 // writes are NOT durable until Sync(). Crash() throws away everything

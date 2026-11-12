@@ -16,8 +16,8 @@ import (
 
 	"github.com/anishathalye/porcupine"
 
-	"github.com/ANAXMD/raft-lab/raft"
-	"github.com/ANAXMD/raft-lab/sim"
+	"github.com/ANAXMD/ForgeDB/raft"
+	"github.com/ANAXMD/ForgeDB/sim"
 )
 
 var seedFlag = flag.Int64("seed", 0, "run a single seed (0 = sweep a range)")

@@ -1,4 +1,4 @@
-module github.com/ANAXMD/raft-lab
+module github.com/ANAXMD/ForgeDB
 
 go 1.24
 
