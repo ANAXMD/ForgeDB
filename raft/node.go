@@ -263,8 +263,44 @@ func (n *raftNode) becomeLeader() {
 	n.bcastAppend()
 }
 
+// acceptable checks whether a message comes from a valid cluster member
+// and whether its AppendEntries entries have consecutive indexes.
+func (n *raftNode) acceptable(m Message) bool {
+	if m.From == n.cfg.ID {
+		return false
+	}
+
+	member := false
+	for _, id := range n.cfg.Peers {
+		if id == m.From {
+			member = true
+			break
+		}
+	}
+	if !member {
+		return false
+	}
+
+	if m.Type == MsgApp {
+		next := m.PrevLogIndex + 1
+
+		for _, entry := range m.Entries {
+			if entry.Index == 0 || entry.Index != next {
+				return false
+			}
+			next++
+		}
+	}
+
+	return true
+}
+
 // Step processes one incoming message.
 func (n *raftNode) Step(m Message) {
+	if !n.acceptable(m) {
+		return
+	}
+
 	// Rule 1: Always check terms before anything else.
 	if m.Term > n.hs.Term {
 		// PreVote messages evaluate a future term. Do not step down!
