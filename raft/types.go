@@ -137,6 +137,7 @@ type Config struct {
 	Peers          []NodeID // all node IDs in the cluster, including ID
 	ElectionTicks  int      // base election timeout; randomize in [ElectionTicks, 2*ElectionTicks)
 	HeartbeatTicks int
+	MaxAppendBytes int // Maximum encoded AppendEntries payload; 0 uses the 4 MiB default.
 	PreVote        bool
 	CheckQuorum    bool
 	Rand           Rand

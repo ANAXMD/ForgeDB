@@ -1,5 +1,7 @@
 package raft
 
+const defaultMaxAppendBytes = 4 << 20 // 4 MiB
+
 // raftNode is the skeleton you will fill in. The plumbing (log storage,
 // Ready/Advance bookkeeping, restore-from-disk) is done and tested through
 // the simulator; the Raft *logic* is marked TODO(Mx) per milestone.
@@ -53,6 +55,9 @@ func validate(cfg Config, p Persisted) {
 	if cfg.HeartbeatTicks <= 0 {
 		panic("raft: invalid config: HeartbeatTicks must be positive")
 	}
+	if cfg.MaxAppendBytes < 0 {
+		panic("raft: invalid config: MaxAppendBytes must not be negative")
+	}
 	if cfg.HeartbeatTicks >= cfg.ElectionTicks {
 		panic("raft: invalid config: HeartbeatTicks must be less than ElectionTicks")
 	}
@@ -92,6 +97,9 @@ func validate(cfg Config, p Persisted) {
 
 // New restores a node from persisted state. Always starts as a Follower.
 func New(cfg Config, p Persisted) Node {
+	if cfg.MaxAppendBytes == 0 {
+		cfg.MaxAppendBytes = defaultMaxAppendBytes
+	}
 	validate(cfg, p)
 
 	n := &raftNode{
@@ -546,7 +554,13 @@ func (n *raftNode) Step(m Message) {
 			if m.MatchIndex+1 > n.nextIndex[m.From] {
 				n.nextIndex[m.From] = m.MatchIndex + 1
 			}
+			before := n.commit
 			n.advanceCommit()
+
+			// If committing did not trigger a broadcast, continue replication now.
+			if n.commit == before && n.nextIndex[m.From] <= n.lastIndex() {
+				n.sendAppend(m.From)
+			}
 		}
 
 	case MsgHeartbeat:
@@ -601,7 +615,8 @@ func (n *raftNode) sendAppend(to NodeID) {
 
 	var ents []Entry
 	if ni <= n.lastIndex() {
-		ents = append([]Entry(nil), n.log[ni-1:]...)
+		count := n.batchLen(ni)
+		ents = append([]Entry(nil), n.log[ni-1:ni-1+Index(count)]...)
 	}
 
 	n.send(Message{
@@ -613,6 +628,29 @@ func (n *raftNode) sendAppend(to NodeID) {
 		Entries:      ents,
 		LeaderCommit: n.commit,
 	})
+}
+
+// entryOverhead bounds batches containing empty or very small entries.
+const entryOverhead = 24
+
+// batchLen returns the number of entries that fit in one AppendEntries
+// message. It always includes at least one entry, even if oversized.
+func (n *raftNode) batchLen(from Index) int {
+	budget := n.cfg.MaxAppendBytes
+	used, count := 0, 0
+
+	for i := int(from); i <= len(n.log); i++ {
+		cost := len(n.log[i-1].Data) + entryOverhead
+
+		if count > 0 && used+cost > budget {
+			break
+		}
+
+		used += cost
+		count++
+	}
+
+	return count
 }
 
 func (n *raftNode) bcastAppend() {
