@@ -143,6 +143,11 @@ type Config struct {
 	Rand           Rand
 }
 
+// DisruptionProtected reports whether both Raft disruption protections are enabled.
+func (c Config) DisruptionProtected() bool {
+	return c.PreVote && c.CheckQuorum
+}
+
 // Rand is the only randomness a node may use.
 type Rand interface {
 	Intn(n int) int

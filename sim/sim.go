@@ -281,6 +281,11 @@ func (s *Sim) deliver(m raft.Message) {
 // Cut blocks messages in both directions between a and b.
 func (s *Sim) Cut(a, b raft.NodeID) { s.cut[link{a, b}], s.cut[link{b, a}] = true, true }
 
+// CutOneWay blocks messages from from to to, but leaves the reverse direction open.
+func (s *Sim) CutOneWay(from, to raft.NodeID) {
+	s.cut[link{from, to}] = true
+}
+
 // Isolate cuts id off from everyone.
 func (s *Sim) Isolate(id raft.NodeID) {
 	for _, o := range s.ids {

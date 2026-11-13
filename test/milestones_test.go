@@ -289,6 +289,7 @@ func TestM5_PreVoteStopsDisruption(t *testing.T) {
 		}
 	}
 }
+
 type kvOpKind uint8
 
 const (
@@ -553,3 +554,100 @@ func TestM6_LinearizableKV(t *testing.T) {
 }
 
 var _ = raft.Follower // keep the import until you use raft types in later tests
+
+// TestM5_OneWayPartitionDoesNotDisruptLeader verifies that a follower
+// unable to receive leader messages cannot disrupt the healthy majority.
+func TestM5_OneWayPartitionDoesNotDisruptLeader(t *testing.T) {
+	for _, seed := range seeds(30) {
+		s := sim.New(sim.Config{
+			Seed:        seed,
+			N:           5,
+			PreVote:     true,
+			CheckQuorum: true,
+		})
+
+		if !s.RunUntil(5_000, func() bool {
+			_, ok := s.Leader()
+			return ok
+		}) {
+			t.Fatalf("seed %d: no leader elected", seed)
+		}
+
+		leader, ok := s.Leader()
+		if !ok {
+			t.Fatalf("seed %d: leader disappeared", seed)
+		}
+		initialTerm := s.Node(leader).Status().Term
+
+		var follower raft.NodeID
+		for _, id := range s.IDs() {
+			if id != leader {
+				follower = id
+				break
+			}
+		}
+
+		// Drop leader-to-follower traffic only. The follower can still
+		// send PreVote and Vote requests to the leader.
+		s.CutOneWay(leader, follower)
+		s.Run(500 * 10)
+		s.Heal()
+		s.Run(100 * 10)
+
+		s.MustBeSafe(t)
+
+		currentLeader, ok := s.Leader()
+		if !ok || currentLeader != leader {
+			t.Fatalf("seed %d: leader changed (got %v, want %v)",
+				seed, currentLeader, leader)
+		}
+
+		for _, id := range s.IDs() {
+			if term := s.Node(id).Status().Term; term != initialTerm {
+				t.Fatalf("seed %d: node %d term = %d, want %d",
+					seed, id, term, initialTerm)
+			}
+		}
+	}
+}
+
+// TestM5_IsolatedLeaderStepsDown verifies that a leader without a majority
+// relinquishes leadership while the remaining nodes can elect a new leader.
+func TestM5_IsolatedLeaderStepsDown(t *testing.T) {
+	for _, seed := range seeds(30) {
+		s := sim.New(sim.Config{
+			Seed:        seed,
+			N:           5,
+			PreVote:     true,
+			CheckQuorum: true,
+		})
+
+		if !s.RunUntil(5_000, func() bool {
+			_, ok := s.Leader()
+			return ok
+		}) {
+			t.Fatalf("seed %d: no initial leader elected", seed)
+		}
+
+		oldLeader, _ := s.Leader()
+		s.Isolate(oldLeader)
+
+		s.Run(500 * 10)
+
+		if s.Node(oldLeader).Status().Role == raft.Leader {
+			t.Fatalf("seed %d: isolated node %d remained leader",
+				seed, oldLeader)
+		}
+
+		newLeader, ok := s.Leader()
+		if !ok {
+			t.Fatalf("seed %d: majority did not elect a new leader", seed)
+		}
+		if newLeader == oldLeader {
+			t.Fatalf("seed %d: isolated node %d is still reported as leader",
+				seed, oldLeader)
+		}
+
+		s.MustBeSafe(t)
+	}
+}

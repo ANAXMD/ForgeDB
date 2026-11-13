@@ -22,9 +22,10 @@ type raftNode struct {
 	electionTimeout  int // randomized
 	heartbeatElapsed int
 
-	votes      map[NodeID]bool
-	matchIndex map[NodeID]Index // Highest log entry known to be replicated on peer
-	nextIndex  map[NodeID]Index // Next log entry to send to peer
+	votes        map[NodeID]bool
+	matchIndex   map[NodeID]Index // Highest log entry known to be replicated on peer
+	nextIndex    map[NodeID]Index // Next log entry to send to peer
+	recentActive map[NodeID]bool  // Peers that responded during the current quorum interval
 	// Ready bookkeeping.
 	hsDirty   bool
 	dirtyFrom Index // lowest log index modified since the last Advance (0 = clean)
@@ -269,12 +270,21 @@ func (n *raftNode) Tick() {
 			}
 		}
 	case Leader:
+		if n.cfg.CheckQuorum {
+			n.electionElapsed++
+			if n.electionElapsed >= n.electionTimeout {
+				n.resetElectionTimer()
+				n.checkQuorum()
+				if n.role != Leader {
+					return
+				}
+			}
+		}
 		n.heartbeatElapsed++
 		if n.heartbeatElapsed >= n.cfg.HeartbeatTicks {
 			n.heartbeatElapsed = 0
 			n.bcastAppend()
 		}
-		// TODO(M5): if cfg.CheckQuorum, step down when no quorum was heard from.
 	}
 }
 
@@ -343,10 +353,12 @@ func (n *raftNode) campaign() {
 func (n *raftNode) becomeLeader() {
 	n.role = Leader
 	n.leader = n.cfg.ID
+	n.electionElapsed = 0
 	n.heartbeatElapsed = 0
 
 	n.matchIndex = make(map[NodeID]Index)
 	n.nextIndex = make(map[NodeID]Index)
+	n.recentActive = make(map[NodeID]bool)
 	lastIdx := n.lastIndex()
 	for _, peer := range n.cfg.Peers {
 		n.matchIndex[peer] = 0
@@ -365,6 +377,38 @@ func (n *raftNode) becomeLeader() {
 		n.advanceCommit()
 	}
 	n.bcastAppend()
+}
+
+// checkQuorum steps down if fewer than a majority responded during the
+// previous election-timeout interval.
+func (n *raftNode) checkQuorum() {
+	if n.role != Leader {
+		return
+	}
+
+	active := 1 // Count the leader itself.
+	for _, peer := range n.cfg.Peers {
+		if peer != n.cfg.ID && n.recentActive[peer] {
+			active++
+		}
+	}
+
+	quorum := (len(n.cfg.Peers) / 2) + 1
+	if active < quorum {
+		n.becomeFollower(n.hs.Term, 0)
+	}
+
+	for peer := range n.recentActive {
+		n.recentActive[peer] = false
+	}
+}
+
+// inLease reports whether this node should ignore higher-term vote requests.
+func (n *raftNode) inLease() bool {
+	if n.role == Leader {
+		return n.cfg.CheckQuorum
+	}
+	return n.leader != 0 && n.electionElapsed < n.cfg.ElectionTicks
 }
 
 // acceptable checks whether a message comes from a valid cluster member
@@ -405,6 +449,18 @@ func (n *raftNode) Step(m Message) {
 		return
 	}
 
+	// Do not let a higher-term election disrupt a leader that still has a lease.
+	if (m.Type == MsgVote || m.Type == MsgPreVote) &&
+		m.Term > n.hs.Term && n.inLease() {
+		return
+	}
+
+	// A rejection from a higher-term node tells this pre-candidate it is behind.
+	if m.Type == MsgPreVoteResp && m.Reject && m.Term > n.hs.Term {
+		n.becomeFollower(m.Term, 0)
+		return
+	}
+
 	// Rule 1: Always check terms before anything else.
 	if m.Term > n.hs.Term {
 		// PreVote messages evaluate a future term. Do not step down!
@@ -432,7 +488,7 @@ func (n *raftNode) Step(m Message) {
 		isUpToDate := m.LastLogTerm > lastTerm || (m.LastLogTerm == lastTerm && m.LastLogIndex >= lastIndex)
 
 		if isUpToDate {
-			n.send(Message{To: m.From, Type: MsgPreVoteResp, Term: n.hs.Term, Reject: false})
+			n.send(Message{To: m.From, Type: MsgPreVoteResp, Term: m.Term, Reject: false})
 		} else {
 			n.send(Message{To: m.From, Type: MsgPreVoteResp, Term: n.hs.Term, Reject: true})
 		}
@@ -536,6 +592,10 @@ func (n *raftNode) Step(m Message) {
 		if n.role != Leader {
 			return
 		}
+		if n.recentActive == nil {
+			n.recentActive = make(map[NodeID]bool)
+		}
+		n.recentActive[m.From] = true
 		if m.Reject {
 			if n.nextIndex[m.From] > 1 {
 				n.nextIndex[m.From]--
