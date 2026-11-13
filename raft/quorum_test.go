@@ -86,3 +86,50 @@ func TestFollowerLeaseRejectsHigherTermVote(t *testing.T) {
 		t.Fatalf("leader = %d, want 2", n.leader)
 	}
 }
+
+func TestPreVoteResponseEchoesRequestedTerm(t *testing.T) {
+	n := newQuorumTestNode()
+	n.hs.Term = 5
+
+	n.Step(Message{
+		From:         2,
+		To:           1,
+		Type:         MsgPreVote,
+		Term:         6,
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	})
+
+	if n.hs.Term != 5 {
+		t.Fatalf("responder term = %d, want 5", n.hs.Term)
+	}
+	if len(n.msgs) != 1 {
+		t.Fatalf("messages = %d, want 1", len(n.msgs))
+	}
+
+	resp := n.msgs[0]
+	if resp.Type != MsgPreVoteResp || resp.Term != 6 || resp.Reject {
+		t.Fatalf("unexpected PreVote response: %+v", resp)
+	}
+}
+
+func TestRejectedHigherTermPreVoteResponseUpdatesTerm(t *testing.T) {
+	n := newQuorumTestNode()
+	n.role = PreCandidate
+	n.hs.Term = 5
+
+	n.Step(Message{
+		From:   2,
+		To:     1,
+		Type:   MsgPreVoteResp,
+		Term:   6,
+		Reject: true,
+	})
+
+	if n.hs.Term != 6 {
+		t.Fatalf("term = %d, want 6", n.hs.Term)
+	}
+	if n.role != Follower {
+		t.Fatalf("role = %v, want Follower", n.role)
+	}
+}
