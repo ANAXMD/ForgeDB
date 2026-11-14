@@ -2,9 +2,9 @@ package raft
 
 const defaultMaxAppendBytes = 4 << 20 // 4 MiB
 
-// raftNode is the skeleton you will fill in. The plumbing (log storage,
-// Ready/Advance bookkeeping, restore-from-disk) is done and tested through
-// the simulator; the Raft *logic* is marked TODO(Mx) per milestone.
+// raftNode is the pure Raft state machine. The simulator and any future
+// storage/network driver interact with it through Tick, Step, Propose, and
+// Ready/Advance; this package itself performs no I/O.
 type raftNode struct {
 	cfg Config
 

@@ -6,7 +6,6 @@
 package test
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/anishathalye/porcupine"
 
+	"github.com/ANAXMD/ForgeDB/kv"
 	"github.com/ANAXMD/ForgeDB/raft"
 	"github.com/ANAXMD/ForgeDB/sim"
 )
@@ -305,14 +305,12 @@ type kvInput struct {
 
 type kvOutput struct {
 	Value string
-	OK    bool
+	Found bool
 }
 
-type kvCommand struct {
-	ReqID uint64
-	Op    kvOpKind
-	Key   string
+type kvModelState struct {
 	Value string
+	Found bool
 }
 
 type clientReq struct {
@@ -348,19 +346,22 @@ var kvModel = porcupine.Model{
 		return partitions
 	},
 	Init: func() any {
-		return ""
+		return kvModelState{}
 	},
 	Step: func(state any, input any, output any) (bool, any) {
-		val := state.(string)
+		current := state.(kvModelState)
 		inp := input.(kvInput)
 		out := output.(kvOutput)
 		if inp.Op == opPut {
-			return true, inp.Value
+			return out.Found && out.Value == inp.Value, kvModelState{
+				Value: inp.Value,
+				Found: true,
+			}
 		}
-		return out.Value == val, val
+		return out.Value == current.Value && out.Found == current.Found, current
 	},
 	Equal: func(s1, s2 any) bool {
-		return s1.(string) == s2.(string)
+		return s1.(kvModelState) == s2.(kvModelState)
 	},
 	DescribeOperation: func(in, out any) string {
 		inp := in.(kvInput)
@@ -371,7 +372,8 @@ var kvModel = porcupine.Model{
 		return fmt.Sprintf("Get('%s') -> '%s'", inp.Key, outp.Value)
 	},
 	DescribeState: func(st any) string {
-		return fmt.Sprintf("'%s'", st.(string))
+		state := st.(kvModelState)
+		return fmt.Sprintf("{value:%q found:%t}", state.Value, state.Found)
 	},
 }
 
@@ -444,7 +446,7 @@ func TestM6_LinearizableKV(t *testing.T) {
 	}
 
 	deadline := s.Now() + 60_000 // 60 virtual seconds
-	kvState := make(map[string]string)
+	kvState := kv.NewStateMachine()
 	appliedCount := make(map[raft.NodeID]int)
 	pending := make(map[uint64]pendingOp)
 	var waiting []clientReq
@@ -468,18 +470,26 @@ func TestM6_LinearizableKV(t *testing.T) {
 		for _, req := range waiting {
 			if s.Now() >= req.targetTime && hasLeader {
 				reqID++
-				cmd := kvCommand{
-					ReqID: reqID,
-					Op:    req.input.Op,
-					Key:   req.input.Key,
-					Value: req.input.Value,
+				cmd := kv.Command{
+					ClientID:  uint64(req.clientID + 1),
+					RequestID: reqID,
+					Key:       req.input.Key,
+					Value:     req.input.Value,
 				}
-				bytes, err := json.Marshal(cmd)
+				switch req.input.Op {
+				case opPut:
+					cmd.Op = kv.OpPut
+				case opGet:
+					cmd.Op = kv.OpGet
+				default:
+					t.Fatalf("unknown test operation: %d", req.input.Op)
+				}
+				data, err := kv.MarshalCommand(cmd)
 				if err != nil {
 					t.Fatalf("json marshal error: %v", err)
 				}
 				callTime := s.Now()
-				if s.Propose(l, bytes) {
+				if s.Propose(l, data) {
 					pending[reqID] = pendingOp{
 						req:      req,
 						callTime: callTime,
@@ -506,20 +516,18 @@ func TestM6_LinearizableKV(t *testing.T) {
 				if len(entry.Data) == 0 {
 					continue
 				}
-				var cmd kvCommand
-				if err := json.Unmarshal(entry.Data, &cmd); err != nil {
-					continue
+				cmd, err := kv.UnmarshalCommand(entry.Data)
+				if err != nil {
+					t.Fatalf("decode committed KV command at index %d: %v", entry.Index, err)
 				}
-				var out kvOutput
-				if cmd.Op == opPut {
-					kvState[cmd.Key] = cmd.Value
-					out = kvOutput{Value: cmd.Value, OK: true}
-				} else {
-					out = kvOutput{Value: kvState[cmd.Key], OK: true}
+				result, err := kvState.Apply(cmd)
+				if err != nil {
+					t.Fatalf("apply committed KV command at index %d: %v", entry.Index, err)
 				}
+				out := kvOutput{Value: result.Value, Found: result.Found}
 
-				if p, exists := pending[cmd.ReqID]; exists {
-					delete(pending, cmd.ReqID)
+				if p, exists := pending[cmd.RequestID]; exists {
+					delete(pending, cmd.RequestID)
 					p.req.respCh <- clientResp{
 						callTime:   p.callTime,
 						returnTime: s.Now(),

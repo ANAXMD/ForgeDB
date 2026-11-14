@@ -1,29 +1,98 @@
-# raft-lab
+# ForgeDB
 
-Raft in Go, built on a deterministic simulator. Pure state machine + seeded virtual clock:
-every run is reproducible from a seed.
+ForgeDB is a Go implementation and test laboratory for the Raft consensus
+protocol. It combines a deterministic fault-injection simulator, a pure Raft
+state machine, a crash-recoverable write-ahead log, a replicated key/value
+state machine, and a Porcupine linearizability test.
 
-    go test ./sim -race            # simulator + checker self-tests (green)
-    go test ./test -v              # milestone tests (RED until you implement them)
-    go test ./test -seed=48213 -run M2 -v   # replay one exact run
+The project is intentionally an engineering prototype: it demonstrates and
+tests consensus, durability primitives, and state-machine behavior. It is not
+yet a production database server and does not expose a network client API.
 
-## Layout
-- `raft/types.go`  Message, Entry, HardState, Ready, and the `Node` interface
-- `raft/node.go`   skeleton node: plumbing done, Raft logic marked `TODO(Mx)`
-- `sim/sim.go`     event queue, virtual clock, lossy/duplicating/partitionable network, crash/restart
-- `sim/disk.go`    fake disk: writes are lost on Crash() unless Sync()ed
-- `sim/check.go`   safety checker run after EVERY event (election safety, log matching,
-                   leader completeness, state machine safety)
-- `test/`          milestone tests, swept over many seeds
+## Requirements
 
-## Rules that keep it deterministic
-No goroutines, no `time.Now`, no global rand, no behavior-affecting map iteration
-(iterate `s.ids`). A node's only randomness is `cfg.Rand`.
+- Go 1.24 or newer
+- Dependencies are vendored; tests can run without downloading modules.
 
-## Driver contract (Ready)
-persist+fsync HardState/Entries -> send Messages -> apply Committed -> Advance().
-Sending before fsync breaks safety; `Config.SkipSync` exists to prove the checker catches it.
+## Quick start
+
+```sh
+go test -mod=vendor ./...
+go test -mod=vendor -race ./...
+go vet -mod=vendor ./...
+```
+
+Replay one deterministic milestone test:
+
+```sh
+go test -mod=vendor ./test -seed=48213 -run M5 -v
+```
+
+Generate a simulation trace:
+
+```sh
+go run -mod=vendor ./cmd/trace -seed=42 -proposals=10 -out=trace.json
+```
+
+Open `web/trace.html` in a browser and load the generated `trace.json` file.
+The viewer can filter events by type or search the event text. No web server,
+JavaScript package manager, or external library is required.
+
+The trace generator accepts `-nodes`, `-proposals`, `-duration`, `-drop`,
+`-dup`, `-seed`, and `-out`. The seed makes the simulated schedule
+reproducible.
+
+## Architecture
+
+- `raft/` — pure Raft state machine. It has no clock, network, disk, goroutine,
+  or global-randomness dependency. The driver supplies ticks and messages and
+  consumes `Ready` output.
+- `sim/` — deterministic discrete-event simulator with seeded message delay,
+  loss, duplication, partitions, crashes, restarts, and safety checks.
+- `wal/` — append-only, checksummed WAL for Raft hard state and log suffixes.
+  `Save` queues changes; `Sync` makes them durable; `Open` recovers synced data
+  and truncates an incomplete final record.
+- `kv/` — deterministic Put/Get state machine with JSON command encoding and
+  per-client request deduplication.
+- `test/` — multi-seed Raft milestone tests and a concurrent KV history checked
+  for linearizability by Porcupine.
+- `cmd/trace/` and `web/` — trace export command and dependency-free browser
+  viewer.
+
+## Raft driver contract
+
+For each `Ready` batch, the driver must:
+
+1. Persist the changed hard state and log entries.
+2. Sync them to durable storage.
+3. Send the outbound messages.
+4. Apply committed entries to the state machine, in order.
+5. Call `Advance`.
+
+Sending messages before the corresponding state is durable can violate Raft
+safety. The simulator's `SkipSync` fault switch deliberately violates this
+ordering so the safety checker can prove it detects the failure.
 
 ## Milestones
-M1 harness (done) | M2 election | M3 replication + Figure 8 | M4 persistence + crash fuzz |
-M5 PreVote, CheckQuorum, client dedupe | M6 KV + Porcupine | M7 visualizer (consumes `Sim.TraceLog`)
+
+- M1 — deterministic simulator and safety checker
+- M2 — leader election and failover
+- M3 — log replication and Figure 8 safety
+- M4 — persistence behavior and crash/restart testing
+- M5 — PreVote and CheckQuorum disruption protection
+- M6 — KV state machine, per-client request deduplication, and Porcupine linearizability validation
+- M7 — reproducible trace export and browser trace viewer
+
+## Scope and limitations
+
+- The simulator is not a real network transport.
+- The WAL is a standalone persistence component; it is not currently wired
+  into a production server process.
+- The KV state machine is an in-memory component applied to committed Raft
+  commands. There is no external client/server protocol or snapshot/compaction
+  layer in this repository.
+- The trace viewer displays simulator log events; it is not a live cluster
+  dashboard.
+
+These boundaries are deliberate. The repository demonstrates the core
+consensus and testing work without claiming to be a production-ready database.
