@@ -59,13 +59,17 @@ func (w *WAL) Save(hs *raft.HardState, entries []raft.Entry) error {
 		return nil
 	}
 
-	payload, err := encodeBatch(hs, entries)
+	chunks, err := encodeBatchChunks(hs, entries)
 	if err != nil {
 		return err
 	}
-	record, err := encodeRecord(recordBatch, payload)
-	if err != nil {
-		return err
+	records := make([][]byte, 0, len(chunks))
+	for _, chunk := range chunks {
+		record, err := encodeRecord(recordBatch, chunk)
+		if err != nil {
+			return err
+		}
+		records = append(records, record)
 	}
 
 	var op pendingOp
@@ -85,7 +89,7 @@ func (w *WAL) Save(hs *raft.HardState, entries []raft.Entry) error {
 		return err
 	}
 
-	w.pending = append(w.pending, record)
+	w.pending = append(w.pending, records...)
 	w.ops = append(w.ops, op)
 	return nil
 }
@@ -148,6 +152,11 @@ func (w *WAL) Close() error {
 //	valid header, payload checksum bad, more bytes follow          -> corruption: refuse to start
 //	checksums fine but the content is invalid (gap, bad encoding)  -> corruption: refuse to start
 //
+// A Save too large for one record is stored as a group of records, all but the
+// last marked "more". The group is applied only when its last record has been
+// read, so a Save is all-or-nothing: a group cut short by a crash is a torn tail,
+// and the truncation goes back to the START of the group, never into its middle.
+//
 // "Refuse to start" never modifies the file. A record is never skipped: once a
 // record's extent or content cannot be trusted, nothing after it can be.
 func (w *WAL) recover() error {
@@ -159,29 +168,48 @@ func (w *WAL) recover() error {
 		return err
 	}
 
+	var (
+		group      pendingOp // records of an unfinished multi-record Save
+		inGroup    bool
+		groupStart int
+		groupRecs  int // records of the unfinished Save read so far
+	)
+	// tailStart is where a torn tail is cut: at the current record, or at the
+	// start of the unfinished group that contains it.
 	off := 0
+	tailStart := func() int64 {
+		if inGroup {
+			return int64(groupStart)
+		}
+		return int64(off)
+	}
+
 	for off < len(data) {
 		rest := data[off:]
 		if len(rest) < recordHeaderSize {
-			return w.truncateTail(int64(off)) // partial header
+			return w.truncateTail(tailStart()) // partial header
 		}
 		kind, length, payloadCRC, ok := parseHeader(rest[:recordHeaderSize])
 		if !ok {
 			if allZero(rest) {
-				return w.truncateTail(int64(off)) // zero-filled tail
+				return w.truncateTail(tailStart()) // zero-filled tail
 			}
 			return fmt.Errorf("wal: corruption at offset %d: %w: bad record header", off, errInvalidRecord)
 		}
 		end := off + recordHeaderSize + int(length)
 		if end > len(data) {
-			return w.truncateTail(int64(off)) // header is trustworthy, payload never finished
+			return w.truncateTail(tailStart()) // header is trustworthy, payload never finished
 		}
 		payload := data[off+recordHeaderSize : end]
 		if crc32.Checksum(payload, castagnoliTable) != payloadCRC {
 			if end == len(data) {
-				return w.truncateTail(int64(off)) // damaged final record
+				return w.truncateTail(tailStart()) // damaged final record
 			}
 			return fmt.Errorf("wal: corruption at offset %d: %w: payload checksum mismatch before the end of the log", off, errInvalidRecord)
+		}
+
+		if inGroup && kind != recordBatch {
+			return fmt.Errorf("wal: corruption at offset %d: %w: record type %d inside a multi-record save", off, errInvalidRecord, kind)
 		}
 
 		switch kind {
@@ -202,15 +230,39 @@ func (w *WAL) recover() error {
 			}
 
 		case recordBatch:
-			op, err := decodeBatch(payload)
+			op, more, err := decodeBatch(payload)
 			if err != nil {
 				return fmt.Errorf("wal: corruption at offset %d: %w", off, err)
+			}
+			if more && !inGroup {
+				inGroup, groupStart, group, groupRecs = true, off, pendingOp{}, 0
+			}
+			if inGroup {
+				// The encoder puts the hard state in the first record only. A
+				// later record carrying one is not something this WAL wrote.
+				if groupRecs > 0 && op.hs != nil {
+					return fmt.Errorf("wal: corruption at offset %d: %w: hard state in record %d of a multi-record save", off, errInvalidRecord, groupRecs+1)
+				}
+				groupRecs++
+				if op.hs != nil {
+					group.hs = op.hs
+				}
+				group.ents = append(group.ents, op.ents...)
+				if more {
+					break // wait for the rest of the Save
+				}
+				op, inGroup = group, false
 			}
 			if err := applyOp(&w.state, op); err != nil {
 				return fmt.Errorf("wal: invalid batch at offset %d: %w", off, err)
 			}
 		}
 		off = end
+	}
+	if inGroup {
+		// The file ends at a record boundary but inside a Save: a crash between
+		// its records. The whole Save is discarded.
+		return w.truncateTail(int64(groupStart))
 	}
 
 	_, err = w.fs.Seek(0, io.SeekEnd)

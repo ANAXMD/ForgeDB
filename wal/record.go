@@ -19,6 +19,11 @@ const (
 var (
 	errInvalidRecord = errors.New("wal: invalid record")
 	errRecordTooBig  = errors.New("wal: record exceeds maximum size")
+
+	// ErrEntryTooLarge is returned by Save for a single log entry that cannot be
+	// stored in one record. Larger Readys are split across records, but an entry
+	// is never split. Callers must bound command size below this.
+	ErrEntryTooLarge = errors.New("wal: entry too large to store in one record")
 )
 
 var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)

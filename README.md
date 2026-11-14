@@ -63,6 +63,14 @@ reproducible.
   by more data. Accepted risk: bit rot in the very last record looks like a torn
   write and is truncated; the other replicas hold that entry. Files written with
   the earlier 9-byte record header are rejected as corrupt.
+  A `Save` larger than one record (16 MiB) is split across records between
+  entries, hard state first, and recovery applies it all-or-nothing: a split
+  `Save` cut short by a crash is discarded back to where it began. Only the first
+  record of a split `Save` may carry the hard state; recovery treats any other
+  placement as corruption and refuses to start. A single log entry is never
+  split; `Save` returns `ErrEntryTooLarge` for one that cannot fit in a record
+  by itself (the hard state never counts against it), so callers must bound
+  command size below that.
 - `kv/` — deterministic Put/Get state machine with JSON command encoding and
   per-client request deduplication.
 - `test/` — multi-seed Raft milestone tests and a concurrent KV history checked
