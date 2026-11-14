@@ -46,8 +46,9 @@ func TestSimDefaultsToWALDisk(t *testing.T) {
 }
 
 // The WAL disk must be indistinguishable from the fake disk for a correct node:
-// same seed, same crashes, identical trace and identical applied logs. A
-// difference means the WAL returned a different state after a restart.
+// same seed, same crashes, identical trace and identical applied logs on every
+// node, and both runs pass the safety checker. A difference means the WAL
+// returned a different state after a restart.
 func TestWALDiskMatchesFakeDisk(t *testing.T) {
 	for seed := int64(1); seed <= 30; seed++ {
 		cfg := Config{Seed: seed, N: 5, DropProb: 0.1, PreVote: seed%2 == 0, CheckQuorum: seed%3 == 0}
@@ -55,8 +56,25 @@ func TestWALDiskMatchesFakeDisk(t *testing.T) {
 		cfg.FakeDisk = true
 		fake := scenario(cfg)
 		real.MustBeSafe(t)
+		fake.MustBeSafe(t)
 		if real.TraceHash() != fake.TraceHash() {
 			t.Fatalf("seed %d: trace with the WAL (%d) differs from the trace with the fake disk (%d)", seed, real.TraceHash(), fake.TraceHash())
+		}
+		applied := 0
+		for _, id := range real.IDs() {
+			a, b := real.Applied(id), fake.Applied(id)
+			if len(a) != len(b) {
+				t.Fatalf("seed %d node %d: applied %d entries with the WAL, %d with the fake disk", seed, id, len(a), len(b))
+			}
+			for i := range a {
+				if a[i].Term != b[i].Term || a[i].Index != b[i].Index || string(a[i].Data) != string(b[i].Data) {
+					t.Fatalf("seed %d node %d: applied entry %d differs: WAL %+v, fake %+v", seed, id, i, a[i], b[i])
+				}
+			}
+			applied += len(a)
+		}
+		if applied == 0 {
+			t.Fatalf("seed %d: nothing was applied, the comparison proves nothing", seed)
 		}
 	}
 }
