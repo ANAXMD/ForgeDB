@@ -50,8 +50,14 @@ reproducible.
 - `sim/` — deterministic discrete-event simulator with seeded message delay,
   loss, duplication, partitions, crashes, restarts, and safety checks.
 - `wal/` — append-only, checksummed WAL for Raft hard state and log suffixes.
-  `Save` queues changes; `Sync` makes them durable; `Open` recovers synced data
-  and truncates an incomplete final record.
+  `Save` queues changes; `Sync` makes them durable; `Open` recovers synced data.
+  Every record has its own header checksum (verified before the length is
+  trusted) and a payload checksum. Recovery truncates only a torn tail (partial
+  header, payload cut short, a damaged final record, or a zero-filled tail) and
+  refuses to start, without modifying the file, on any damage that is followed
+  by more data. Accepted risk: bit rot in the very last record looks like a torn
+  write and is truncated; the other replicas hold that entry. Files written with
+  the earlier 9-byte record header are rejected as corrupt.
 - `kv/` — deterministic Put/Get state machine with JSON command encoding and
   per-client request deduplication.
 - `test/` — multi-seed Raft milestone tests and a concurrent KV history checked

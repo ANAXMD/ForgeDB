@@ -1,9 +1,9 @@
 package wal
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 
 	"github.com/ANAXMD/ForgeDB/raft"
@@ -137,78 +137,93 @@ func (w *WAL) Close() error {
 	return w.fs.Close()
 }
 
+// recover rebuilds the state from the file. Every condition has one outcome:
+//
+//	clean EOF at a record boundary                                 -> done
+//	fewer than a full header remain                                -> torn tail: truncate
+//	valid header, payload runs past EOF                            -> torn tail: truncate
+//	valid header, payload checksum bad, record ends exactly at EOF -> torn tail: truncate
+//	bad header, every remaining byte is zero                       -> zero-filled tail: truncate
+//	bad header (checksum, type, length), non-zero bytes remain     -> corruption: refuse to start
+//	valid header, payload checksum bad, more bytes follow          -> corruption: refuse to start
+//	checksums fine but the content is invalid (gap, bad encoding)  -> corruption: refuse to start
+//
+// "Refuse to start" never modifies the file. A record is never skipped: once a
+// record's extent or content cannot be trusted, nothing after it can be.
 func (w *WAL) recover() error {
 	if _, err := w.fs.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
+	data, err := io.ReadAll(w.fs)
+	if err != nil {
+		return err
+	}
 
-	var offset int64
-	for {
-		start := offset
-		header := make([]byte, recordHeaderSize)
-		n, err := io.ReadFull(w.fs, header)
-
-		if err == io.EOF && n == 0 {
-			break
+	off := 0
+	for off < len(data) {
+		rest := data[off:]
+		if len(rest) < recordHeaderSize {
+			return w.truncateTail(int64(off)) // partial header
 		}
-		if err == io.ErrUnexpectedEOF || (err == io.EOF && n > 0) {
-			return w.truncateTail(start)
+		kind, length, payloadCRC, ok := parseHeader(rest[:recordHeaderSize])
+		if !ok {
+			if allZero(rest) {
+				return w.truncateTail(int64(off)) // zero-filled tail
+			}
+			return fmt.Errorf("wal: corruption at offset %d: %w: bad record header", off, errInvalidRecord)
 		}
-		if err != nil {
-			return err
+		end := off + recordHeaderSize + int(length)
+		if end > len(data) {
+			return w.truncateTail(int64(off)) // header is trustworthy, payload never finished
 		}
-		offset += recordHeaderSize
-
-		length := binary.BigEndian.Uint32(header[1:5])
-		if length > maxRecordSize {
-			return fmt.Errorf("%w: record length %d exceeds limit", errInvalidRecord, length)
-		}
-
-		payload := make([]byte, int(length))
-		n, err = io.ReadFull(w.fs, payload)
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return w.truncateTail(start)
-		}
-		if err != nil {
-			return err
-		}
-		offset += int64(n)
-
-		kind, err := decodeRecord(header, payload)
-		if err != nil {
-			return fmt.Errorf("wal: corruption at offset %d: %w", start, err)
+		payload := data[off+recordHeaderSize : end]
+		if crc32.Checksum(payload, castagnoliTable) != payloadCRC {
+			if end == len(data) {
+				return w.truncateTail(int64(off)) // damaged final record
+			}
+			return fmt.Errorf("wal: corruption at offset %d: %w: payload checksum mismatch before the end of the log", off, errInvalidRecord)
 		}
 
 		switch kind {
 		case recordHardState:
 			hs, err := decodeHardState(payload)
 			if err != nil {
-				return fmt.Errorf("wal: corruption at offset %d: %w", start, err)
+				return fmt.Errorf("wal: corruption at offset %d: %w", off, err)
 			}
 			w.state.HardState = hs
 
 		case recordEntries:
 			entries, err := decodeEntries(payload)
 			if err != nil {
-				return fmt.Errorf("wal: corruption at offset %d: %w", start, err)
+				return fmt.Errorf("wal: corruption at offset %d: %w", off, err)
 			}
 			if err := applyOp(&w.state, pendingOp{ents: entries}); err != nil {
-				return fmt.Errorf("wal: invalid log at offset %d: %w", start, err)
+				return fmt.Errorf("wal: invalid log at offset %d: %w", off, err)
 			}
 
 		case recordBatch:
 			op, err := decodeBatch(payload)
 			if err != nil {
-				return fmt.Errorf("wal: corruption at offset %d: %w", start, err)
+				return fmt.Errorf("wal: corruption at offset %d: %w", off, err)
 			}
 			if err := applyOp(&w.state, op); err != nil {
-				return fmt.Errorf("wal: invalid batch at offset %d: %w", start, err)
+				return fmt.Errorf("wal: invalid batch at offset %d: %w", off, err)
 			}
 		}
+		off = end
 	}
 
-	_, err := w.fs.Seek(0, io.SeekEnd)
+	_, err = w.fs.Seek(0, io.SeekEnd)
 	return err
+}
+
+func allZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (w *WAL) truncateTail(offset int64) error {
