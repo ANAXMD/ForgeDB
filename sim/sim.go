@@ -39,6 +39,10 @@ type Config struct {
 	// deliberate bug switch: with a correct node + checker, crash tests must
 	// start failing when this is on. That proves the harness has teeth.
 	SkipSync bool
+	// FakeDisk selects the in-memory fake Disk instead of the real WAL on an
+	// in-memory file. The WAL is the default so that every simulated crash and
+	// restart runs the real recovery code; the fake exists for cross-checking.
+	FakeDisk bool
 	NewNode  NodeFactory
 }
 
@@ -66,7 +70,7 @@ func (c *Config) defaults() {
 type host struct {
 	id      raft.NodeID
 	node    raft.Node
-	disk    *Disk
+	disk    disk
 	up      bool
 	applied []raft.Entry // this host's volatile state machine input
 	rng     *rand.Rand
@@ -144,13 +148,20 @@ func New(cfg Config) *Sim {
 		s.ids = append(s.ids, raft.NodeID(i))
 	}
 	for _, id := range s.ids {
-		h := &host{id: id, disk: &Disk{}, rng: rand.New(rand.NewSource(s.rng.Int63()))}
+		h := &host{id: id, disk: s.newDisk(), rng: rand.New(rand.NewSource(s.rng.Int63()))}
 		s.hosts[id] = h
 		s.boot(h)
 		// Stagger tick phases deterministically so nodes aren't in lock-step.
 		s.scheduleTick(h, 1+s.rng.Int63n(cfg.TickMs))
 	}
 	return s
+}
+
+func (s *Sim) newDisk() disk {
+	if s.cfg.FakeDisk {
+		return &Disk{}
+	}
+	return NewWALDisk()
 }
 
 func (s *Sim) boot(h *host) {

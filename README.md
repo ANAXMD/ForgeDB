@@ -48,7 +48,12 @@ reproducible.
   or global-randomness dependency. The driver supplies ticks and messages and
   consumes `Ready` output.
 - `sim/` — deterministic discrete-event simulator with seeded message delay,
-  loss, duplication, partitions, crashes, restarts, and safety checks.
+  loss, duplication, partitions, crashes, restarts, and safety checks. Each
+  simulated node persists to the real `wal/` package on an in-memory file
+  (`wal.MemFS`, where unsynced bytes are lost on a crash), so every restart in
+  the milestone and fuzz tests runs the real recovery code. `Config.FakeDisk`
+  selects the older in-memory fake disk; a test checks that both give identical
+  traces.
 - `wal/` — append-only, checksummed WAL for Raft hard state and log suffixes.
   `Save` queues changes; `Sync` makes them durable; `Open` recovers synced data.
   Every record has its own header checksum (verified before the length is
