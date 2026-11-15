@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 )
 
 // FS is the small filesystem surface required by the WAL.
@@ -35,6 +36,14 @@ var syncDir = syncDirectory
 // removeFile deletes a half-created WAL file; a variable so tests can fail it.
 var removeFile = os.Remove
 
+// openMu serializes OpenFile within the process. Creation is a sequence (create,
+// sync the directory, and on failure remove the file) and the file is visible to
+// other callers throughout it. Without the lock a second caller could open the
+// half-created file, sync the directory successfully, and return a handle to a
+// file the first caller then removes. It does not coordinate separate processes:
+// two processes must not open the same WAL path at once in any case.
+var openMu sync.Mutex
+
 // OpenFile opens a WAL file, creating it if it does not exist.
 //
 // When the file is created, its parent directory is fsynced before OpenFile
@@ -59,6 +68,9 @@ var removeFile = os.Remove
 // directory is synced before the file is returned, and if that fails the file
 // is closed and the error returned.
 func OpenFile(path string) (FS, error) {
+	openMu.Lock()
+	defer openMu.Unlock()
+
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
 	if errors.Is(err, fs.ErrExist) {
 		return openExisting(path)

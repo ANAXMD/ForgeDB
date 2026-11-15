@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ANAXMD/ForgeDB/raft"
 )
@@ -344,5 +346,86 @@ func TestUnsupportedPlatformRefusesEmptyExistingFile(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("file must be left in place: %v", err)
+	}
+}
+
+// A second OpenFile arriving while the first is between its failed directory
+// sync and its cleanup must not be handed the half-created file: it would sync
+// the directory successfully, return a handle, and then lose the file when the
+// first caller removes it, leaving a WAL that is no longer reachable by path.
+//
+// The first caller is parked inside its directory sync. The second caller is
+// started; once it signals that it is about to call OpenPath it is given time to
+// run (a correct implementation makes it wait; the broken one finishes in
+// microseconds). Then the first caller is released.
+func TestConcurrentOpenDuringFailedCreationCannotReturnUnlinkedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "raft.wal")
+	boom := errors.New("injected directory sync failure")
+
+	var syncCalls atomic.Int32
+	aInSync := make(chan struct{})
+	releaseA := make(chan struct{})
+	old := syncDir
+	syncDir = func(string) error {
+		if syncCalls.Add(1) == 1 { // caller A's creation sync
+			close(aInSync)
+			<-releaseA
+			return boom
+		}
+		return nil // every later sync succeeds
+	}
+	t.Cleanup(func() { syncDir = old })
+
+	aErr := make(chan error, 1)
+	go func() {
+		w, err := OpenPath(path)
+		if w != nil {
+			w.Close()
+		}
+		aErr <- err
+	}()
+	<-aInSync // A created the file and is parked in its failing directory sync
+
+	type result struct {
+		w   *WAL
+		err error
+	}
+	bStarted := make(chan struct{})
+	bRes := make(chan result, 1)
+	go func() {
+		close(bStarted) // immediately before B calls OpenPath
+		w, err := OpenPath(path)
+		bRes <- result{w, err}
+	}()
+	<-bStarted // the observation period starts only once B is running
+
+	var b result
+	bDone := false
+	select {
+	case b = <-bRes: // B finished while A is still in flight
+		bDone = true
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(releaseA)
+
+	if err := <-aErr; !errors.Is(err, boom) {
+		t.Fatalf("A: err = %v, want the directory sync error", err)
+	}
+	if !bDone {
+		b = <-bRes
+	}
+	if b.err != nil {
+		t.Fatalf("B: %v", b.err)
+	}
+	defer b.w.Close()
+
+	// Whatever B was given must be the file at path, not an unlinked inode.
+	saveOne(t, b.w)
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("B holds a WAL but %s does not exist: its writes are unreachable (bDone before A cleanup: %v)", path, bDone)
+	}
+	if fi.Size() == 0 {
+		t.Fatalf("B's synced write is not visible at %s", path)
 	}
 }
