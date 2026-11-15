@@ -71,6 +71,29 @@ reproducible.
   split; `Save` returns `ErrEntryTooLarge` for one that cannot fit in a record
   by itself (the hard state never counts against it), so callers must bound
   command size below that.
+  Directory durability: `wal.OpenFile` (used by `OpenPath`) creates a new WAL
+  file exclusively and fsyncs the parent directory before returning, so once
+  `OpenPath` succeeds a crash cannot lose the file's name within that directory,
+  only unsynced contents. This assumes the parent directory itself already
+  exists durably: syncing it persists the WAL's entry inside it, not the
+  directory's own entry in its parent. A caller that has just created the WAL
+  directory must sync that directory's parent itself (and so on up to a
+  directory known to be durable); `OpenPath` neither creates nor syncs
+  ancestors. A directory sync error is returned, the new file is removed (so a
+  retry creates and syncs again), and no WAL is handed back. Opening an existing
+  non-empty file does not touch its directory, since data is only ever synced
+  after the creating open succeeded. An existing zero-length file is treated as
+  possibly the leftover of a failed creation whose cleanup also failed: its
+  directory is synced before it is returned, and if that fails the open fails
+  and no WAL is returned. An empty WAL that was never written to therefore costs
+  one directory sync per open until its first record is synced.
+  Platform limits: this relies on fsync of a directory handle (Linux, macOS, the
+  BSDs). On Windows, plan9, js and wasip1, creating a new WAL, or opening an
+  empty one, fails with `ErrDirSyncUnsupported` instead of claiming durability;
+  existing non-empty files still open. Some filesystems (certain network mounts)
+  reject directory fsync; that error is returned too and is not ignored. The
+  in-memory `MemFS` has no directory, so the simulator does not model directory
+  entries.
 - `kv/` — deterministic Put/Get state machine with JSON command encoding and
   per-client request deduplication.
 - `test/` — multi-seed Raft milestone tests and a concurrent KV history checked
