@@ -423,22 +423,41 @@ func TestM6_LinearizableKV(t *testing.T) {
 					return
 				}
 
+				// complete records a successful response in the history, once. A
+				// response with ok == false (the request was never accepted) is
+				// not an operation and is not recorded.
+				complete := func(resp clientResp) {
+					if !resp.ok {
+						return
+					}
+					historyMu.Lock()
+					history = append(history, porcupine.Operation{
+						ClientId: clientID,
+						Input:    inp,
+						Call:     resp.callTime,
+						Output:   resp.output,
+						Return:   resp.returnTime,
+					})
+					historyMu.Unlock()
+					// Pace next request: 200 to 500 virtual ms later
+					nextTarget = resp.returnTime + int64(rng.Intn(300)+200)
+				}
+
 				select {
 				case resp := <-respCh:
-					if resp.ok {
-						historyMu.Lock()
-						history = append(history, porcupine.Operation{
-							ClientId: clientID,
-							Input:    inp,
-							Call:     resp.callTime,
-							Output:   resp.output,
-							Return:   resp.returnTime,
-						})
-						historyMu.Unlock()
-						// Pace next request: 200 to 500 virtual ms later
-						nextTarget = resp.returnTime + int64(rng.Intn(300)+200)
-					}
+					complete(resp)
 				case <-done:
+					// done is closed only after the main loop has delivered every
+					// response it ever will (respCh is buffered, so those sends
+					// never block). If one is already waiting, select may still
+					// have picked done: take it, or a completed operation would be
+					// dropped from the history. If none is waiting, the request is
+					// genuinely incomplete and is left out.
+					select {
+					case resp := <-respCh:
+						complete(resp)
+					default:
+					}
 					return
 				}
 			}
@@ -451,6 +470,46 @@ func TestM6_LinearizableKV(t *testing.T) {
 	pending := make(map[uint64]pendingOp)
 	var waiting []clientReq
 	var reqID uint64
+
+	// processApplied reads the current leader's applied entries that this test
+	// has not handled yet (tracked per node in appliedCount), applies each
+	// committed command to the shared KV state machine, and completes the
+	// matching pending request, if any, with a successful response.
+	processApplied := func() {
+		l, ok := s.Leader()
+		if !ok {
+			return
+		}
+		applied := s.Applied(l)
+		idx := appliedCount[l]
+		for idx < len(applied) {
+			entry := applied[idx]
+			idx++
+			if len(entry.Data) == 0 {
+				continue
+			}
+			cmd, err := kv.UnmarshalCommand(entry.Data)
+			if err != nil {
+				t.Fatalf("decode committed KV command at index %d: %v", entry.Index, err)
+			}
+			result, err := kvState.Apply(cmd)
+			if err != nil {
+				t.Fatalf("apply committed KV command at index %d: %v", entry.Index, err)
+			}
+			out := kvOutput{Value: result.Value, Found: result.Found}
+
+			if p, exists := pending[cmd.RequestID]; exists {
+				delete(pending, cmd.RequestID)
+				p.req.respCh <- clientResp{
+					callTime:   p.callTime,
+					returnTime: s.Now(),
+					output:     out,
+					ok:         true,
+				}
+			}
+		}
+		appliedCount[l] = idx
+	}
 
 	for s.Now() < deadline {
 		// 1. Ingest any incoming requests into waiting list
@@ -507,43 +566,29 @@ func TestM6_LinearizableKV(t *testing.T) {
 		s.Run(20)
 
 		// 4. Process newly applied entries on the leader
-		if l, ok := s.Leader(); ok {
-			applied := s.Applied(l)
-			idx := appliedCount[l]
-			for idx < len(applied) {
-				entry := applied[idx]
-				idx++
-				if len(entry.Data) == 0 {
-					continue
-				}
-				cmd, err := kv.UnmarshalCommand(entry.Data)
-				if err != nil {
-					t.Fatalf("decode committed KV command at index %d: %v", entry.Index, err)
-				}
-				result, err := kvState.Apply(cmd)
-				if err != nil {
-					t.Fatalf("apply committed KV command at index %d: %v", entry.Index, err)
-				}
-				out := kvOutput{Value: result.Value, Found: result.Found}
-
-				if p, exists := pending[cmd.RequestID]; exists {
-					delete(pending, cmd.RequestID)
-					p.req.respCh <- clientResp{
-						callTime:   p.callTime,
-						returnTime: s.Now(),
-						output:     out,
-						ok:         true,
-					}
-				}
-			}
-			appliedCount[l] = idx
-		}
+		processApplied()
 
 		runtime.Gosched()
 	}
 
-	// Wait up to 5 virtual seconds for any pending operations to finish committing
-	s.RunUntil(5_000, func() bool { return len(pending) == 0 })
+	// Drain: give pending operations up to 5 virtual seconds to commit. RunUntil
+	// would only advance the simulator; the applied entries still have to be
+	// processed to complete the requests, so advance in small steps and process
+	// after each one. No new requests are dispatched while draining.
+	const drainBudget, drainStep = int64(5_000), int64(20)
+	drainEnd := s.Now() + drainBudget
+	for len(pending) > 0 && s.Now() < drainEnd {
+		step := drainStep
+		if rest := drainEnd - s.Now(); rest < step {
+			step = rest
+		}
+		s.Run(step)
+		processApplied()
+	}
+	if len(pending) > 0 {
+		t.Logf("drain deadline reached after %d virtual ms: %d operation(s) still pending; %d request(s) remain in the local waiting queue (requests still buffered in reqCh or not yet sent by clients are not counted); none of these are in the history",
+			drainBudget, len(pending), len(waiting))
+	}
 
 	// Signal clients to finish and wait for all goroutines
 	close(done)
