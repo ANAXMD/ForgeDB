@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Dependencies are vendored; never download modules in CI.
+  GOFLAGS: -mod=vendor
+
+jobs:
+  check:
+    name: Format, vet, race tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: gofmt
+        run: |
+          files="$(git ls-files '*.go' | grep -v '^vendor/' | xargs gofmt -l)"
+          if [ -n "$files" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$files"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race ./... -count=1
+
+  vet-windows:
+    name: Vet (windows)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # Cross-compile check: keeps the platform-specific paths (for example the
+      # unsupported directory-sync platforms) building and vetting.
+      - name: go vet (GOOS=windows)
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: go vet ./...
