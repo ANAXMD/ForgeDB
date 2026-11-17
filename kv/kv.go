@@ -15,10 +15,13 @@ const (
 	OpGet Op = "get"
 )
 
+const MaxCommandSize = 1 << 20 // 1 MiB of encoded JSON.
+
 var (
 	ErrInvalidCommand    = errors.New("kv: invalid command")
 	ErrUnknownOp         = errors.New("kv: unknown operation")
 	ErrRequestIDConflict = errors.New("kv: request ID reused with different command")
+	ErrCommandTooLarge   = errors.New("kv: command too large")
 )
 
 // Command is one operation submitted through Raft.
@@ -61,11 +64,22 @@ func MarshalCommand(cmd Command) ([]byte, error) {
 	if err := validateCommand(cmd); err != nil {
 		return nil, err
 	}
-	return json.Marshal(cmd)
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > MaxCommandSize {
+		return nil, ErrCommandTooLarge
+	}
+	return data, nil
 }
 
 // UnmarshalCommand decodes and validates a Raft log command.
 func UnmarshalCommand(data []byte) (Command, error) {
+	if len(data) > MaxCommandSize {
+		return Command{}, ErrCommandTooLarge
+	}
+
 	var cmd Command
 
 	decoder := json.NewDecoder(bytes.NewReader(data))

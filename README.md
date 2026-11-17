@@ -94,8 +94,9 @@ reproducible.
   reject directory fsync; that error is returned too and is not ignored. The
   in-memory `MemFS` has no directory, so the simulator does not model directory
   entries.
-- `kv/` — deterministic Put/Get state machine with JSON command encoding and
-  per-client request deduplication.
+- `kv/` — deterministic Put/Get state machine with JSON command encoding,
+  per-client request deduplication, and a 1 MiB maximum encoded command size
+  enforced at the marshal/unmarshal boundary.
 - `test/` — multi-seed Raft milestone tests and a concurrent KV history checked
   for linearizability by Porcupine.
 - `cmd/trace/` and `web/` — trace export command and dependency-free browser

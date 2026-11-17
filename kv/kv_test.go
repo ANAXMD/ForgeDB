@@ -1,7 +1,9 @@
 package kv
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -132,6 +134,50 @@ func TestMarshalUnmarshalCommand(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("round trip = %+v, want %+v", got, want)
+	}
+}
+
+func TestCommandSizeLimit(t *testing.T) {
+	cmd := Command{
+		ClientID:  1,
+		RequestID: 1,
+		Op:        OpPut,
+		Key:       "k",
+		Value:     "x",
+	}
+
+	oneByte, err := json.Marshal(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valueBytes := MaxCommandSize - (len(oneByte) - len(cmd.Value))
+	cmd.Value = strings.Repeat("x", valueBytes)
+
+	data, err := MarshalCommand(cmd)
+	if err != nil {
+		t.Fatalf("MarshalCommand at exact limit: %v", err)
+	}
+	if len(data) != MaxCommandSize {
+		t.Fatalf("encoded size = %d, want %d", len(data), MaxCommandSize)
+	}
+	if got, err := UnmarshalCommand(data); err != nil || got != cmd {
+		t.Fatalf("UnmarshalCommand at exact limit = (%+v, %v), want command and nil", got, err)
+	}
+	oversizedEncoded := append(append([]byte(nil), data...), ' ')
+	if _, err := UnmarshalCommand(oversizedEncoded); !errors.Is(err, ErrCommandTooLarge) {
+		t.Fatalf("UnmarshalCommand one byte over limit = %v, want ErrCommandTooLarge", err)
+	}
+
+	cmd.Value += "x"
+	if data, err := MarshalCommand(cmd); !errors.Is(err, ErrCommandTooLarge) || data != nil {
+		t.Fatalf("MarshalCommand over limit = (%d bytes, %v), want (nil, ErrCommandTooLarge)", len(data), err)
+	}
+}
+
+func TestUnmarshalRejectsOversizedInputBeforeDecoding(t *testing.T) {
+	data := []byte(strings.Repeat(" ", MaxCommandSize+1))
+	if _, err := UnmarshalCommand(data); !errors.Is(err, ErrCommandTooLarge) {
+		t.Fatalf("UnmarshalCommand error = %v, want ErrCommandTooLarge", err)
 	}
 }
 
